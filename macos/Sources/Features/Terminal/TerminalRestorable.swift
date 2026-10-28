@@ -76,6 +76,12 @@ final class TerminalRestorableState: TerminalRestorable {
     var titleOverride: String? {
         internalState.titleOverride
     }
+    var claudeSessionID: String? {
+        internalState.claudeSessionID
+    }
+    var claudeSessionDir: String? {
+        internalState.claudeSessionDir
+    }
 
     /// Internal State we use to perform unit tests
     ///
@@ -170,6 +176,11 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
 
         // Restore the tab title override
         c.titleOverride = state.titleOverride
+
+        // Restoration only brings back a shell, so start the Claude session again.
+        if let sessionID = state.claudeSessionID {
+            c.resumeClaudeSession(sessionID, in: state.claudeSessionDir)
+        }
 
         // Setup our restored state on the controller
         // Find the focused surface in surfaceTree

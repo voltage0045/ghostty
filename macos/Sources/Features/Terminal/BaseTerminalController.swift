@@ -106,6 +106,15 @@ class BaseTerminalController: NSWindowController,
         didSet { applyTitleToWindow() }
     }
 
+    /// When true, closing this terminal never asks for confirmation even if a
+    /// process is running.
+    var skipsCloseConfirmation: Bool { false }
+
+    /// Whether closing this terminal should ask for confirmation first.
+    var needsCloseConfirmation: Bool {
+        !skipsCloseConfirmation && surfaceTree.contains(where: { $0.needsConfirmQuit })
+    }
+
     /// The last computed title from the focused surface (without the override).
     private var lastComputedTitle: String = "👻"
 
@@ -474,7 +483,7 @@ class BaseTerminalController: NSWindowController,
         guard surfaceTree.contains(node) else { return }
 
         // If the child process is not alive, then we exit immediately
-        guard withConfirmation else {
+        guard withConfirmation, !skipsCloseConfirmation else {
             removeSurfaceNode(node)
             return
         }
@@ -913,7 +922,12 @@ class BaseTerminalController: NSWindowController,
         applyTitleToWindow()
     }
 
-    private func applyTitleToWindow() {
+    /// Subclasses can replace the terminal-provided title. `titleOverride` still wins.
+    func titleReplacement(for computedTitle: String) -> String? {
+        nil
+    }
+
+    func applyTitleToWindow() {
         guard let window else { return }
 
         if let titleOverride {
@@ -923,7 +937,7 @@ class BaseTerminalController: NSWindowController,
             return
         }
 
-        window.title = lastComputedTitle
+        window.title = titleReplacement(for: lastComputedTitle) ?? lastComputedTitle
     }
 
     func pwdDidChange(to: URL?) {
@@ -1205,7 +1219,7 @@ class BaseTerminalController: NSWindowController,
         guard alert == nil else { return false }
 
         // If our surfaces don't require confirmation, close.
-        if !surfaceTree.contains(where: { $0.needsConfirmQuit }) { return true }
+        if !needsCloseConfirmation { return true }
 
         return false
     }

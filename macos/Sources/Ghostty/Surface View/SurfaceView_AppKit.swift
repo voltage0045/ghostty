@@ -147,8 +147,34 @@ extension Ghostty {
         // exit safely.
         var needsConfirmQuit: Bool {
             guard let surface = self.surface else { return false }
-            return ghostty_surface_needs_confirm_quit(surface)
+            guard ghostty_surface_needs_confirm_quit(surface) else { return false }
+
+            // The core decides using shell integration's prompt tracking. Without it
+            // (e.g. Apple's /bin/bash 3.2, which can't be integrated) it always asks.
+            // If the shell itself is the foreground process, nothing else is running.
+            let config = (NSApp.delegate as? AppDelegate)?.ghostty.config
+            if config?.confirmCloseSurface != "always", foregroundIsShell {
+                return false
+            }
+
+            return true
         }
+
+        /// Whether the PTY's foreground process group is led by a shell, meaning the
+        /// shell is waiting at its prompt rather than running a command.
+        private var foregroundIsShell: Bool {
+            guard let pid = surfaceModel?.foregroundPID, let pid = Int32(exactly: pid) else { return false }
+            var buffer = [CChar](repeating: 0, count: 256)
+            guard proc_name(pid, &buffer, UInt32(buffer.count)) > 0 else { return false }
+            // Login shells may be named with a leading dash, e.g. "-bash".
+            var name = Substring(String(cString: buffer))
+            if name.hasPrefix("-") { name = name.dropFirst() }
+            return Self.shellNames.contains(String(name))
+        }
+
+        private static let shellNames: Set<String> = [
+            "bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "xonsh", "elvish",
+        ]
 
         // Returns true if the process in this surface has exited.
         var processExited: Bool {

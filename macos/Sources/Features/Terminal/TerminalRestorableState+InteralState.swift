@@ -15,6 +15,11 @@ extension TerminalRestorableState {
         let effectiveFullscreenMode: FullscreenMode?
         let tabColor: TerminalTabColor?
         let titleOverride: String?
+
+        // The Claude Code session opened from the tab sidebar, resumed on restore.
+        // Optional with a default so older states decode and tests needn't pass it.
+        var claudeSessionID: String? = nil
+        var claudeSessionDir: String? = nil
     }
 }
 
@@ -26,6 +31,8 @@ extension TerminalRestorableState.InternalState where ViewType == Ghostty.Surfac
             effectiveFullscreenMode: controller.fullscreenStyle?.fullscreenMode,
             tabColor: (controller.window as? TerminalWindow)?.tabColor,
             titleOverride: controller.titleOverride,
+            claudeSessionID: controller.claudeSessionID,
+            claudeSessionDir: controller.claudeSessionDir,
         )
     }
 }

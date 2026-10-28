@@ -61,6 +61,83 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// The notification cancellable for focused surface property changes.
     private var surfaceAppearanceCancellables: Set<AnyCancellable> = []
 
+    /// The Claude Code session this tab was opened to resume from the session sidebar, if any.
+    var claudeSessionID: String? {
+        didSet {
+            window?.invalidateRestorableState()
+            observeClaudeSessionTitle()
+        }
+    }
+
+    /// Claude session tabs close without confirmation: the session can be resumed
+    /// from the sidebar, so killing Claude loses nothing that can't be recovered.
+    override var skipsCloseConfirmation: Bool { claudeSessionID != nil }
+
+    /// Updates the title when the session's sidebar name or title changes.
+    private var claudeSessionTitleCancellable: AnyCancellable?
+
+    /// The project directory of `claudeSessionID`. `claude --resume` must run here.
+    var claudeSessionDir: String?
+
+    private func observeClaudeSessionTitle() {
+        guard claudeSessionID != nil else {
+            claudeSessionTitleCancellable = nil
+            applyTitleToWindow()
+            return
+        }
+
+        let store = ClaudeSessionStore.shared
+        claudeSessionTitleCancellable = store.$metadata.map { _ in () }
+            .merge(with: store.$sessions.map { _ in () })
+            // @Published emits before the value is stored, so read it next turn.
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.applyTitleToWindow() }
+    }
+
+    /// Tabs opened for a Claude session show the session's sidebar name, keeping
+    /// any leading status glyphs from the terminal title (Claude Code's "✳", the
+    /// bell's "🔔") so progress is still visible.
+    override func titleReplacement(for computedTitle: String) -> String? {
+        guard let claudeSessionID else { return nil }
+        let store = ClaudeSessionStore.shared
+        let name = store.metadata(for: claudeSessionID).displayName
+            ?? store.sessions.first { $0.id == claudeSessionID }?.title
+        guard let name else { return nil }
+
+        // A title made only of symbols (e.g. the default "👻") has no prefix to keep.
+        let prefix = computedTitle.prefix { !$0.isLetter && !$0.isNumber }
+        return prefix.count < computedTitle.count ? prefix + name : name
+    }
+
+    /// Types `claude --resume` into the focused surface of a restored tab. The shell
+    /// starts in the restored pwd, which may not be the session's project directory.
+    func resumeClaudeSession(_ sessionID: String, in directory: String?, attempts: Int = 0) {
+        claudeSessionID = sessionID
+        claudeSessionDir = directory
+
+        // Surfaces are created asynchronously on restore; wait for one (up to ~5s).
+        guard let surface = (focusedSurface ?? surfaceTree.root?.leftmostLeaf())?.surfaceModel else {
+            guard attempts < 50 else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+                self?.resumeClaudeSession(sessionID, in: directory, attempts: attempts + 1)
+            }
+            return
+        }
+
+        var command = "claude --resume \(Ghostty.Shell.quote(sessionID))"
+        if let directory, FileManager.default.fileExists(atPath: directory) {
+            command = "cd \(Ghostty.Shell.quote(directory)) && \(command)"
+        }
+
+        // Text is sent with paste semantics, so press Enter separately to run it.
+        surface.sendText(command)
+        surface.sendKeyEvent(.init(key: .enter, action: .press))
+        surface.sendKeyEvent(.init(key: .enter, action: .release))
+    }
+
+    /// The state for the Claude session sidebar.
+    private(set) lazy var sessionSidebarModel = SessionSidebarModel(controller: self)
+
     init(_ ghostty: Ghostty.App,
          withBaseConfig base: Ghostty.SurfaceConfiguration? = nil,
          withSurfaceTree tree: SplitTree<Ghostty.SurfaceView>? = nil,
@@ -985,7 +1062,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // needs quit confirmation. This lets us attach the confirmation to something
         // that is running.
         guard let confirmWindow = all
-            .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })?
+            .first(where: { $0.needsCloseConfirmation })?
             .surfaceTree.first(where: { $0.needsConfirmQuit })?
             .window
         else {
@@ -1114,14 +1191,20 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // Initialize our content view to the SwiftUI root
         let container = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            HStack(spacing: 0) {
+                SessionSidebarView(model: sessionSidebarModel, ghostty: ghostty)
+                TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            }
         }
 
         // Set the initial content size on the container so that
         // intrinsicContentSize returns the correct value immediately,
         // without waiting for @FocusedValue to propagate through the
-        // SwiftUI focus chain.
-        container.initialContentSize = focusedSurface?.initialSize
+        // SwiftUI focus chain. The sidebar is added on top of the terminal
+        // size so the terminal keeps its configured dimensions.
+        container.initialContentSize = focusedSurface?.initialSize.map {
+            NSSize(width: $0.width + SessionSidebarView.currentWidth, height: $0.height)
+        }
 
         window.contentView = container
 
@@ -1328,7 +1411,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
-        guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
+        guard needsCloseConfirmation else {
             closeTabImmediately()
             return
         }
@@ -1359,7 +1442,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
 
             // Check if any surfaces require confirmation
-            return controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+            return controller.needsCloseConfirmation
         }) else {
             self.closeOtherTabsImmediately()
             return
@@ -1386,7 +1469,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 return false
             }
 
-            return controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
+            return controller.needsCloseConfirmation
         }
 
         if !needsConfirm {
@@ -1445,7 +1528,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let windows: [NSWindow] = window.tabGroup?.windows ?? [window]
         let confirmControllers = windows
             .compactMap({ $0.windowController as? TerminalController })
-            .filter({ $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })
+            .filter({ $0.needsCloseConfirmation })
         guard
             !confirmControllers.isEmpty
         else {

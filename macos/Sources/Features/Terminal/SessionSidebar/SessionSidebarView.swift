@@ -84,15 +84,20 @@ struct SessionSidebarView: View {
     /// The fixed sidebar width. Shared by all windows so switching tabs doesn't jump.
     static let width: CGFloat = 260
 
-    /// The width of the strip left when the sidebar is collapsed.
-    static let collapsedWidth: CGFloat = 36
+    /// Collapsed state is shared by all windows and persisted. The toggle lives in
+    /// the titlebar (see TerminalController) so nothing is left when collapsed.
+    static let collapsedKey = "SessionSidebarCollapsed"
 
-    /// Collapsed state is shared by all windows and persisted.
-    private static let collapsedKey = "SessionSidebarCollapsed"
+    static func toggleCollapsed() {
+        let defaults = UserDefaults.standard
+        withAnimation(.easeInOut(duration: 0.15)) {
+            defaults.set(!defaults.bool(forKey: collapsedKey), forKey: collapsedKey)
+        }
+    }
 
     /// The width the sidebar currently takes, for sizing new windows.
     static var currentWidth: CGFloat {
-        UserDefaults.standard.bool(forKey: collapsedKey) ? collapsedWidth : width
+        UserDefaults.standard.bool(forKey: collapsedKey) ? 0 : width
     }
 
     @ObservedObject var model: SessionSidebarModel
@@ -114,14 +119,14 @@ struct SessionSidebarView: View {
     }
 
     var body: some View {
-        Group {
-            if collapsed {
-                collapsedBody
-            } else {
-                expandedBody
-            }
+        if !collapsed {
+            sidebar
         }
-        .frame(width: collapsed ? Self.collapsedWidth : Self.width)
+    }
+
+    private var sidebar: some View {
+        expandedBody
+        .frame(width: Self.width)
         .frame(maxHeight: .infinity)
         .background(background.ignoresSafeArea())
         .overlay(alignment: .trailing) {
@@ -134,27 +139,6 @@ struct SessionSidebarView: View {
         .onAppear {
             model.refresh()
             sessions.refresh()
-        }
-    }
-
-    private func toggleCollapsed() {
-        withAnimation(.easeInOut(duration: 0.15)) { collapsed.toggle() }
-    }
-
-    private var collapsedBody: some View {
-        VStack {
-            Button(action: toggleCollapsed) {
-                Image(systemName: "sidebar.left")
-                    .font(.system(size: 14))
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Show Sidebar")
-            .padding(.top, 12)
-
-            Spacer()
         }
     }
 
@@ -182,7 +166,7 @@ struct SessionSidebarView: View {
                             }
                             .help("Refresh")
 
-                            Button(action: toggleCollapsed) {
+                            Button(action: Self.toggleCollapsed) {
                                 Image(systemName: "sidebar.left")
                             }
                             .help("Hide Sidebar")

@@ -109,6 +109,35 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         return prefix.count < computedTitle.count ? prefix + name : name
     }
 
+    @objc func toggleSessionSidebar(_ sender: Any?) {
+        SessionSidebarView.toggleCollapsed()
+    }
+
+    private func makeSessionSidebarToggle() -> NSTitlebarAccessoryViewController {
+        // AppKit rather than SwiftUI: SwiftUI titlebar accessories break content
+        // scaling when the tab bar appears (see TerminalWindow.tabBarDidAppear).
+        let button = NSButton(
+            image: NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle Sidebar")!,
+            target: self,
+            action: #selector(toggleSessionSidebar(_:)))
+        button.isBordered = false
+        button.contentTintColor = .secondaryLabelColor
+        button.toolTip = "Toggle Claude Sessions Sidebar"
+        button.translatesAutoresizingMaskIntoConstraints = false
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 32, height: 28))
+        container.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+            button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+        ])
+
+        let accessory = NSTitlebarAccessoryViewController()
+        accessory.layoutAttribute = .leading
+        accessory.view = container
+        return accessory
+    }
+
     /// Types `claude --resume` into the focused surface of a restored tab. The shell
     /// starts in the restored pwd, which may not be the session's project directory.
     func resumeClaudeSession(_ sessionID: String, in directory: String?, attempts: Int = 0) {
@@ -1207,6 +1236,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         window.contentView = container
+
+        // The session sidebar toggle sits next to the traffic lights, so a
+        // collapsed sidebar leaves nothing behind in the content area.
+        if window.styleMask.contains(.titled) {
+            window.addTitlebarAccessoryViewController(makeSessionSidebarToggle())
+        }
 
         // If we have a default size, we want to apply it.
         if let defaultSize {

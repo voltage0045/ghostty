@@ -153,11 +153,25 @@ extension Ghostty {
             // (e.g. Apple's /bin/bash 3.2, which can't be integrated) it always asks.
             // If the shell itself is the foreground process, nothing else is running.
             let config = (NSApp.delegate as? AppDelegate)?.ghostty.config
-            if config?.confirmCloseSurface != "always", foregroundIsShell {
+            if config?.confirmCloseSurface != "always", foregroundIsShell || foregroundIsIdleClaude {
                 return false
             }
 
             return true
+        }
+
+        /// Whether the foreground process is a Claude Code session waiting for input.
+        /// Claude Code registers running sessions in ~/.claude/sessions/<pid>.json with
+        /// a status of "busy" while it's working. An idle session can be resumed, so
+        /// closing it loses nothing.
+        private var foregroundIsIdleClaude: Bool {
+            guard let pid = surfaceModel?.foregroundPID else { return false }
+            let file = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".claude/sessions/\(pid).json")
+            guard let data = try? Data(contentsOf: file),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  (json["pid"] as? NSNumber)?.intValue == pid else { return false }
+            return json["status"] as? String != "busy"
         }
 
         /// Whether the PTY's foreground process group is led by a shell, meaning the

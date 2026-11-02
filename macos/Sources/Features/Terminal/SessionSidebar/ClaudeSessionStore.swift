@@ -7,6 +7,9 @@ struct ClaudeSession: Identifiable, Equatable {
     /// The session ID (the jsonl file name without extension).
     let id: String
 
+    /// The session's jsonl file.
+    let file: URL
+
     /// The title Claude Code generated or the user set via /rename, falling back
     /// to the first user prompt.
     let title: String
@@ -45,7 +48,10 @@ struct ClaudeSessionMetadata: Codable, Equatable {
     var archived: Bool?
     var displayName: String?
 
-    var isEmpty: Bool { !starred && archived == nil && displayName == nil }
+    /// A user-created category the session is filed under.
+    var category: String?
+
+    var isEmpty: Bool { !starred && archived == nil && displayName == nil && category == nil }
 }
 
 /// Discovers Claude Code sessions in `~/.claude/projects` (read-only) and stores
@@ -76,6 +82,12 @@ final class ClaudeSessionStore: ObservableObject {
     private let queue = DispatchQueue(label: "com.mitchellh.ghostty.claude-sessions", qos: .utility)
     private var cache: [URL: (modified: Date, size: Int, session: ClaudeSession?)] = [:]
     private var scanInFlight = false
+
+    /// Lowercased user prompts per session file, for search. Only accessed on `queue`.
+    private var promptCache: [URL: (modified: Date, size: Int, text: String)] = [:]
+
+    /// Incremented per search so stale background results are dropped.
+    private var searchGeneration = 0
     private var timer: Timer?
     private var cancellables: Set<AnyCancellable> = []
 
@@ -109,7 +121,8 @@ final class ClaudeSessionStore: ObservableObject {
     func isArchived(_ session: ClaudeSession) -> Bool {
         let meta = metadata(for: session.id)
         if let archived = meta.archived { return archived }
-        guard autoArchiveDays > 0 else { return false }
+        // Filing a session is a deliberate choice to keep it, so don't auto-archive.
+        guard meta.category == nil, autoArchiveDays > 0 else { return false }
         return session.lastActivity < Date().addingTimeInterval(-Double(autoArchiveDays) * 24 * 60 * 60)
     }
 
@@ -124,6 +137,60 @@ final class ClaudeSessionStore: ObservableObject {
 
     func setStarred(_ starred: Bool, for id: String) {
         updateMetadata(for: id) { $0.starred = starred }
+    }
+
+    // MARK: Categories
+
+    /// User-created categories, in display order.
+    @Published private(set) var categories: [String] = UserDefaults.standard.stringArray(forKey: categoriesKey) ?? [] {
+        didSet { UserDefaults.standard.set(categories, forKey: Self.categoriesKey) }
+    }
+
+    private static let categoriesKey = "SessionSidebarCategories"
+
+    /// Adds a category, returning the name actually used (nil if empty).
+    @discardableResult
+    func addCategory(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if !categories.contains(trimmed) { categories.append(trimmed) }
+        return trimmed
+    }
+
+    func renameCategory(_ old: String, to new: String) {
+        let trimmed = new.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != old, let index = categories.firstIndex(of: old) else { return }
+
+        // Renaming onto an existing category merges the two.
+        if categories.contains(trimmed) {
+            categories.remove(at: index)
+        } else {
+            categories[index] = trimmed
+        }
+        for (id, meta) in metadata where meta.category == old {
+            metadata[id]?.category = trimmed
+        }
+        saveMetadata()
+    }
+
+    /// Deletes a category. Its sessions become uncategorized.
+    func deleteCategory(_ name: String) {
+        categories.removeAll { $0 == name }
+        for (id, meta) in metadata where meta.category == name {
+            updateMetadata(for: id) { $0.category = nil }
+        }
+        saveMetadata()
+    }
+
+    func moveCategory(_ name: String, by offset: Int) {
+        guard let index = categories.firstIndex(of: name) else { return }
+        let target = index + offset
+        guard categories.indices.contains(target) else { return }
+        categories.swapAt(index, target)
+    }
+
+    func setCategory(_ category: String?, for id: String) {
+        updateMetadata(for: id) { $0.category = category }
     }
 
     func setArchived(_ archived: Bool, for id: String) {
@@ -151,6 +218,11 @@ final class ClaudeSessionStore: ObservableObject {
         guard let data = try? Data(contentsOf: metadataURL),
               let decoded = try? JSONDecoder().decode([String: ClaudeSessionMetadata].self, from: data) else { return }
         metadata = decoded
+
+        // Keep categories in sync with sessions filed under them.
+        for name in Set(decoded.values.compactMap(\.category)) where !categories.contains(name) {
+            categories.append(name)
+        }
     }
 
     private func saveMetadata() {
@@ -168,6 +240,112 @@ final class ClaudeSessionStore: ObservableObject {
                 AppDelegate.logger.warning("failed to save claude session metadata: \(error.localizedDescription)")
             }
         }
+    }
+
+    // MARK: Search
+
+    /// IDs of sessions whose prompts contain the current query, or nil when not searching.
+    @Published private(set) var contentMatches: Set<String>?
+    @Published private(set) var isSearching = false
+
+    /// Search the text of user prompts in the background. Titles and directories are
+    /// matched synchronously by the view; this covers the conversation itself.
+    func searchContent(_ query: String) {
+        searchGeneration += 1
+        let generation = searchGeneration
+        let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !needle.isEmpty else {
+            contentMatches = nil
+            isSearching = false
+            return
+        }
+
+        isSearching = true
+        let sessions = self.sessions
+        queue.async { [weak self] in
+            guard let self else { return }
+            var matches: Set<String> = []
+            for session in sessions {
+                // A newer search supersedes this one.
+                if self.isStale(generation) { return }
+                if self.promptText(for: session.file).contains(needle) { matches.insert(session.id) }
+            }
+            DispatchQueue.main.async {
+                guard generation == self.searchGeneration else { return }
+                self.contentMatches = matches
+                self.isSearching = false
+            }
+        }
+    }
+
+    private func isStale(_ generation: Int) -> Bool {
+        DispatchQueue.main.sync { generation != searchGeneration }
+    }
+
+    /// Cached lowercased prompt text of a session file. Called on `queue`.
+    private func promptText(for file: URL) -> String {
+        let values = try? file.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey])
+        let modified = values?.contentModificationDate ?? .distantPast
+        let size = values?.fileSize ?? 0
+        if let cached = promptCache[file], cached.modified == modified, cached.size == size {
+            return cached.text
+        }
+
+        var text = ""
+        if let data = try? Data(contentsOf: file, options: .mappedIfSafe) {
+            // Session files total hundreds of MB, so filter lines at the byte level
+            // and only decode the few that are typed prompts.
+            Self.forEachLine(in: data, containing: Self.userMarker, excluding: Self.toolResultMarker) { line in
+                guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                      obj["isSidechain"] as? Bool != true,
+                      obj["isMeta"] as? Bool != true,
+                      let message = obj["message"] as? [String: Any] else { return }
+                for block in Self.textBlocks(message["content"]) where !block.hasPrefix("<") {
+                    text += block.lowercased()
+                    text += "\n"
+                }
+            }
+        }
+
+        promptCache[file] = (modified, size, text)
+        return text
+    }
+
+    private static let userMarker = Array("\"type\":\"user\"".utf8)
+
+    /// Tool results are also "user" messages; this skips them.
+    private static let toolResultMarker = Array("\"tool_use_id\"".utf8)
+
+    /// Calls `body` with each newline-delimited line that contains `marker` but not `excluded`.
+    private static func forEachLine(
+        in data: Data,
+        containing marker: [UInt8],
+        excluding excluded: [UInt8],
+        _ body: (Data) -> Void
+    ) {
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            var start = 0
+            let count = raw.count
+            while start < count {
+                let rest = count - start
+                let newline = memchr(base + start, 0x0A, rest)
+                let end = newline.map { base.distance(to: UnsafeRawPointer($0)) } ?? count
+                let length = end - start
+                if length > 0,
+                   memmem(base + start, length, marker, marker.count) != nil,
+                   memmem(base + start, length, excluded, excluded.count) == nil {
+                    body(Data(bytes: base + start, count: length))
+                }
+                start = end + 1
+            }
+        }
+    }
+
+    private static func textBlocks(_ content: Any?) -> [String] {
+        if let string = content as? String { return [string] }
+        guard let blocks = content as? [[String: Any]] else { return [] }
+        return blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
     }
 
     // MARK: Scanning
@@ -262,15 +440,17 @@ final class ClaudeSessionStore: ObservableObject {
         // cwd and usage lines are frequent and can be large, so we only collect them
         // here and JSON-parse just the few we need afterwards.
         var cwdLines: [Substring] = []
-        var usageLines: [Substring] = []
+        var usageLines: [(index: Int, line: Substring)] = []
+        var lastCompact: (index: Int, line: Substring)?
 
-        for line in lines {
+        for (index, line) in lines.enumerated() {
             // The 1M context variant is only visible as a "[1m]" model suffix
             // (e.g. in /model output), never in the assistant message itself.
             if !oneMillion && line.contains("[1m]") { oneMillion = true }
 
             if line.contains("\"cwd\"") { cwdLines.append(line) }
-            if line.contains("\"type\":\"assistant\"") && line.contains("\"usage\"") { usageLines.append(line) }
+            if line.contains("\"type\":\"assistant\"") && line.contains("\"usage\"") { usageLines.append((index, line)) }
+            if line.contains("\"compact_boundary\"") { lastCompact = (index, line) }
 
             let isTitle = line.contains("\"custom-title\"") || line.contains("\"ai-title\"") || line.contains("\"type\":\"summary\"")
             let wantsPrompt = firstPrompt == nil && line.contains("\"type\":\"user\"")
@@ -307,7 +487,8 @@ final class ClaudeSessionStore: ObservableObject {
         var contextTokens: Int?
         var model: String?
         var lastActivity: Date?
-        for line in usageLines.reversed() {
+        var usageIndex = -1
+        for (index, line) in usageLines.reversed() {
             guard let obj = mainChainObject(line),
                   let message = obj["message"] as? [String: Any],
                   let usage = message["usage"] as? [String: Any] else { continue }
@@ -317,7 +498,20 @@ final class ClaudeSessionStore: ObservableObject {
             contextTokens = total
             model = message["model"] as? String
             lastActivity = (obj["timestamp"] as? String).flatMap(parseTimestamp)
+            usageIndex = index
             break
+        }
+
+        // Size the window from the pre-compaction usage, which may exceed 200k.
+        let peakTokens = contextTokens ?? 0
+
+        // After /compact the context shrinks, but no assistant turn reports it until
+        // the next reply. The compaction record carries the new size.
+        if let lastCompact, lastCompact.index > usageIndex,
+           let obj = mainChainObject(lastCompact.line),
+           let meta = obj["compactMetadata"] as? [String: Any],
+           let post = (meta["postTokens"] as? NSNumber)?.intValue {
+            contextTokens = post
         }
 
         // A session Claude never replied to is just noise (e.g. an aborted start).
@@ -326,12 +520,13 @@ final class ClaudeSessionStore: ObservableObject {
         let title = customTitle ?? aiTitle ?? summary ?? firstPrompt ?? "Untitled Session"
         return ClaudeSession(
             id: file.deletingPathExtension().lastPathComponent,
+            file: file,
             title: title,
             cwd: cwd,
             projectDir: projectDir,
             lastActivity: lastActivity ?? modified,
             contextTokens: contextTokens,
-            contextWindow: contextWindow(model: model, oneMillion: oneMillion, used: contextTokens ?? 0))
+            contextWindow: contextWindow(model: model, oneMillion: oneMillion, used: peakTokens))
     }
 
     private static let timestampFormatter: ISO8601DateFormatter = {

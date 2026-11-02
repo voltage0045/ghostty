@@ -1,44 +1,29 @@
 import AppKit
 import Combine
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The state for the Claude session sidebar of a single terminal window.
+@MainActor
 final class SessionSidebarModel: ObservableObject {
-    /// Claude session IDs that are open in some tab, across all windows.
+    /// Claude session IDs that are running anywhere (in any terminal).
     @Published private(set) var openSessionIDs: Set<String> = []
 
     private weak var controller: TerminalController?
     private var cancellables: Set<AnyCancellable> = []
-    private var refreshScheduled = false
 
     init(controller: TerminalController) {
         self.controller = controller
 
-        // Tabs opening or closing can change which sessions are open.
-        let center = NotificationCenter.default
-        Publishers.MergeMany(
-            center.publisher(for: NSWindow.didBecomeKeyNotification),
-            center.publisher(for: NSWindow.willCloseNotification)
-        )
-        .sink { [weak self] _ in self?.scheduleRefresh() }
-        .store(in: &cancellables)
-    }
-
-    /// Coalesce bursts of notifications into one refresh on the next runloop turn.
-    /// This also lets AppKit settle window state (e.g. after a window closes).
-    func scheduleRefresh() {
-        guard !refreshScheduled else { return }
-        refreshScheduled = true
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.refreshScheduled = false
-            self.refresh()
-        }
+        ClaudeLiveSessions.shared.$running
+            .map { Set($0.keys) }
+            .removeDuplicates()
+            .sink { [weak self] in self?.openSessionIDs = $0 }
+            .store(in: &cancellables)
     }
 
     func refresh() {
-        let open = Set(TerminalController.all.compactMap { $0.window != nil ? $0.claudeSessionID : nil })
-        if open != openSessionIDs { openSessionIDs = open }
+        ClaudeLiveSessions.shared.refresh()
     }
 
     /// The last path component of a directory, or "~" for the home directory.
@@ -47,34 +32,106 @@ final class SessionSidebarModel: ObservableObject {
         return (path as NSString).lastPathComponent
     }
 
+    /// The Ghostty tab running or opened for this session, if any.
+    private func tab(for session: ClaudeSession) -> TerminalController? {
+        ClaudeLiveSessions.shared.controller(for: session.id)
+            ?? TerminalController.all.first { $0.claudeSessionID == session.id && $0.window != nil }
+    }
+
     /// Focuses the tab already running this session, or opens a new tab that
     /// resumes it in the session's original working directory.
     func open(_ session: ClaudeSession) {
-        if let existing = TerminalController.all.first(where: { $0.claudeSessionID == session.id }),
-           let existingWindow = existing.window {
-            existingWindow.makeKeyAndOrderFront(nil)
+        if let existing = tab(for: session), let window = existing.window {
+            window.makeKeyAndOrderFront(nil)
             return
         }
 
-        guard let controller else { return }
+        let directory = session.projectDir ?? session.cwd
+        let newController = newTab(
+            in: directory,
+            command: "claude --resume \(Ghostty.Shell.quote(session.id))")
+        newController?.claudeSessionID = session.id
+        newController?.claudeSessionDir = directory
+    }
+
+    /// Whether the session runs in another terminal app, where we can't restart it.
+    func isRunningOutsideGhostty(_ session: ClaudeSession) -> Bool {
+        openSessionIDs.contains(session.id) && ClaudeLiveSessions.shared.controller(for: session.id) == nil
+    }
+
+    /// Quits and resumes the session in its tab, or opens it if it isn't open.
+    func restart(_ session: ClaudeSession) {
+        guard !isRunningOutsideGhostty(session) else { return NSSound.beep() }
+        guard let existing = tab(for: session) else { return open(session) }
+        existing.window?.makeKeyAndOrderFront(nil)
+        existing.restartClaudeSession()
+    }
+
+    /// Starts an ihk workflow for a requirement in a new tab.
+    func startRequirement(_ requirementID: String, workflow: String) {
+        newTab(
+            in: NewRequirement.directory,
+            command: "ihk flow run \(Ghostty.Shell.quote(workflow)) --ddp \(Ghostty.Shell.quote(requirementID))")
+    }
+
+    /// Opens a tab in `directory` (home if missing) and types `command` into its shell,
+    /// so the user's PATH and shell setup apply.
+    @discardableResult
+    private func newTab(in directory: String?, command: String) -> TerminalController? {
+        guard let controller else { return nil }
 
         var config = Ghostty.SurfaceConfiguration()
-        if let cwd = session.projectDir ?? session.cwd, FileManager.default.fileExists(atPath: cwd) {
-            config.workingDirectory = cwd
+        if let directory, FileManager.default.fileExists(atPath: directory) {
+            config.workingDirectory = directory
         } else {
             config.workingDirectory = FileManager.default.homeDirectoryForCurrentUser.path
         }
+        config.initialInput = command + "\n"
 
-        // Sent through the user's shell so their PATH (and claude install) applies.
-        config.initialInput = "claude --resume \(Ghostty.Shell.quote(session.id))\n"
+        return TerminalController.newTab(controller.ghostty, from: controller.window, withBaseConfig: config)
+    }
+}
 
-        let newController = TerminalController.newTab(
-            controller.ghostty,
-            from: controller.window,
-            withBaseConfig: config)
-        newController?.claudeSessionID = session.id
-        newController?.claudeSessionDir = session.projectDir ?? session.cwd
-        scheduleRefresh()
+/// Starting a new requirement with `ihk flow run`.
+enum NewRequirement {
+    static let directory = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("pax-api").path
+
+    /// Used when `ihk flow list` can't be read (e.g. the directory isn't initialized).
+    static let fallbackWorkflows = ["mobility-tech-flow-v2", "mobility-tech-flow-v3", "mobility-tech-flow"]
+
+    /// Requirement IDs look like "T-IBT-614650".
+    static func isValidID(_ id: String) -> Bool {
+        id.range(of: #"^[A-Z]+-[A-Z]+-\d+$"#, options: .regularExpression) != nil
+    }
+
+    /// Lists available workflows via `ihk flow list`, falling back to known names.
+    static func loadWorkflows(_ completion: @escaping ([String]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            // A login shell, so PATH matches what the user's terminal has.
+            process.executableURL = URL(fileURLWithPath: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh")
+            process.arguments = ["-lc", "ihk flow list"]
+            process.currentDirectoryURL = URL(fileURLWithPath: directory)
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+
+            var names: [String] = []
+            if (try? process.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                // Lines look like "  mobility-tech-flow-v2 [agent]".
+                for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+                    let parts = line.split(separator: " ")
+                    if parts.count == 2, parts[1].hasPrefix("["), line.hasPrefix("  ") {
+                        names.append(String(parts[0]))
+                    }
+                }
+            }
+
+            DispatchQueue.main.async { completion(names.isEmpty ? fallbackWorkflows : names) }
+        }
     }
 }
 
@@ -108,6 +165,8 @@ struct SessionSidebarView: View {
     @State private var archivedExpanded = false
     @State private var renamingSessionID: String?
     @State private var renameText = ""
+    @State private var searchText = ""
+    @State private var showingNewRequirement = false
 
     private var background: Color {
         Color(nsColor: NSColor(ghostty.config.backgroundColor).blended(withFraction: 0.06, of: .white)
@@ -153,14 +212,32 @@ struct SessionSidebarView: View {
             list.filter { sessions.metadata(for: $0.id).starred }
                 + list.filter { !sessions.metadata(for: $0.id).starred }
         }
-        let pinned = starredFirst(sessions.sessions.filter { !isArchived($0) })
-        let archived = starredFirst(sessions.sessions.filter(isArchived))
+        let searching = !searchText.trimmingCharacters(in: .whitespaces).isEmpty
+        // While searching, archived sessions are included so they can be found.
+        let pinned = searching
+            ? starredFirst(sessions.sessions.filter(matchesSearch))
+            : starredFirst(sessions.sessions.filter { !isArchived($0) })
+        let archived = searching ? [] : starredFirst(sessions.sessions.filter(isArchived))
+
+        // Filed sessions show under their category; the rest follow the categories.
+        let categoryOf = { (s: ClaudeSession) -> String? in
+            guard let name = sessions.metadata(for: s.id).category, sessions.categories.contains(name) else { return nil }
+            return name
+        }
+        let unfiled = searching ? pinned : pinned.filter { categoryOf($0) == nil }
 
         VStack(spacing: 0) {
+            toolbar
+
             ScrollView(.vertical) {
                 LazyVStack(alignment: .leading, spacing: 2) {
                     SectionHeader(title: "Claude Sessions") {
                         HStack(spacing: 10) {
+                            Button(action: newCategory) {
+                                Image(systemName: "folder.badge.plus")
+                            }
+                            .help("New Category")
+
                             Button(action: { sessions.refresh() }) {
                                 Image(systemName: "arrow.clockwise")
                             }
@@ -173,16 +250,26 @@ struct SessionSidebarView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    // Dropping a session on the header takes it out of its category.
+                    .onDrop(of: [.plainText], isTargeted: nil) { providers in
+                        dropSession(providers, into: nil)
+                    }
+
+                    if !searching {
+                        ForEach(sessions.categories, id: \.self) { name in
+                            categorySection(name, sessions: pinned.filter { categoryOf($0) == name })
+                        }
+                    }
 
                     if pinned.isEmpty {
-                        Text("No sessions")
+                        Text(searching ? (sessions.isSearching ? "Searching…" : "No matches") : "No sessions")
                             .font(.system(size: 12))
                             .foregroundStyle(.tertiary)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 4)
                     }
 
-                    ForEach(pinned) { sessionRow($0) }
+                    ForEach(unfiled) { sessionRow($0) }
 
                     if !archived.isEmpty {
                         Button {
@@ -215,6 +302,167 @@ struct SessionSidebarView: View {
             Divider().opacity(0.5)
             SidebarFooter(sessions: sessions)
         }
+        // Debounce content search while typing.
+        .task(id: searchText) {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            sessions.searchContent(searchText)
+        }
+    }
+
+    // MARK: Categories
+
+    @AppStorage("SessionSidebarCollapsedCategories") private var collapsedCategoriesRaw = ""
+
+    private var collapsedCategories: Set<String> {
+        Set(collapsedCategoriesRaw.split(separator: "\n").map(String.init))
+    }
+
+    private func toggleCategory(_ name: String) {
+        var set = collapsedCategories
+        if set.contains(name) { set.remove(name) } else { set.insert(name) }
+        collapsedCategoriesRaw = set.sorted().joined(separator: "\n")
+    }
+
+    @ViewBuilder
+    private func categorySection(_ name: String, sessions filed: [ClaudeSession]) -> some View {
+        let collapsed = collapsedCategories.contains(name)
+
+        Button { toggleCategory(name) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: collapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .frame(width: 10)
+                Image(systemName: "folder")
+                Text(name)
+                    .lineLimit(1)
+                Spacer()
+                Text("\(filed.count)")
+                    .foregroundStyle(.tertiary)
+            }
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 10)
+            .frame(height: 26)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onDrop(of: [.plainText], isTargeted: nil) { providers in
+            dropSession(providers, into: name)
+        }
+        .contextMenu {
+            Button("Rename Category…") {
+                if let new = Self.promptForName(title: "Rename Category", initial: name) {
+                    sessions.renameCategory(name, to: new)
+                }
+            }
+            Button("Move Up") { sessions.moveCategory(name, by: -1) }
+                .disabled(sessions.categories.first == name)
+            Button("Move Down") { sessions.moveCategory(name, by: 1) }
+                .disabled(sessions.categories.last == name)
+            Divider()
+            Button("Delete Category") { sessions.deleteCategory(name) }
+        }
+
+        if !collapsed {
+            ForEach(filed) { sessionRow($0) }
+                .padding(.leading, 12)
+        }
+    }
+
+    private func newCategory() {
+        if let name = Self.promptForName(title: "New Category", initial: "") {
+            sessions.addCategory(name)
+        }
+    }
+
+    /// Asks for a category for the session, creating it, then files the session.
+    private func fileInNewCategory(_ session: ClaudeSession) {
+        guard let name = Self.promptForName(title: "New Category", initial: ""),
+              let added = sessions.addCategory(name) else { return }
+        sessions.setCategory(added, for: session.id)
+    }
+
+    private func dropSession(_ providers: [NSItemProvider], into category: String?) -> Bool {
+        guard let provider = providers.first else { return false }
+        _ = provider.loadObject(ofClass: NSString.self) { object, _ in
+            guard let id = object as? String else { return }
+            DispatchQueue.main.async { sessions.setCategory(category, for: id) }
+        }
+        return true
+    }
+
+    /// A simple modal text prompt.
+    static func promptForName(title: String, initial: String) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = initial
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
+    }
+
+    /// Titles, names, and directories match immediately; prompt text matches once
+    /// the background content search finishes.
+    private func matchesSearch(_ session: ClaudeSession) -> Bool {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        let fields = [
+            sessions.displayTitle(for: session), session.title,
+            session.cwd ?? "", session.projectDir ?? "", session.id,
+        ]
+        if fields.contains(where: { $0.localizedCaseInsensitiveContains(query) }) { return true }
+        return sessions.contentMatches?.contains(session.id) ?? false
+    }
+
+    private var toolbar: some View {
+        VStack(spacing: 8) {
+            Button {
+                showingNewRequirement = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus.circle")
+                    Text("New Requirement…")
+                    Spacer()
+                }
+                .font(.system(size: 13))
+                .padding(.horizontal, 10)
+                .frame(height: 28)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .popover(isPresented: $showingNewRequirement, arrowEdge: .trailing) {
+                NewRequirementForm { id, workflow in
+                    showingNewRequirement = false
+                    model.startRequirement(id, workflow: workflow)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search sessions", text: $searchText)
+                    .textFieldStyle(.plain)
+                    .onExitCommand { searchText = "" }
+                if !searchText.isEmpty {
+                    Button { searchText = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 8)
+            .frame(height: 26)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06)))
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 10)
     }
 
     @ViewBuilder
@@ -228,6 +476,11 @@ struct SessionSidebarView: View {
             isRenaming: renamingSessionID == session.id,
             renameText: $renameText,
             onOpen: { model.open(session) },
+            categories: sessions.categories,
+            onSetCategory: { sessions.setCategory($0, for: session.id) },
+            onNewCategory: { fileInNewCategory(session) },
+            canRestart: !model.isRunningOutsideGhostty(session),
+            onRestart: { model.restart(session) },
             onStar: { sessions.setStarred(!sessions.metadata(for: session.id).starred, for: session.id) },
             onArchive: { sessions.setArchived(!sessions.isArchived(session), for: session.id) },
             onBeginRename: {
@@ -394,6 +647,11 @@ private struct SessionRow: View {
     let isRenaming: Bool
     @Binding var renameText: String
     let onOpen: () -> Void
+    let categories: [String]
+    let onSetCategory: (String?) -> Void
+    let onNewCategory: () -> Void
+    let canRestart: Bool
+    let onRestart: () -> Void
     let onStar: () -> Void
     let onArchive: () -> Void
     let onBeginRename: () -> Void
@@ -442,7 +700,17 @@ private struct SessionRow: View {
                 Circle()
                     .fill(Color.green)
                     .frame(width: 6, height: 6)
-                    .help("Open in a tab")
+                    .help("Running")
+            }
+
+            if isHovered && canRestart {
+                Button(action: onRestart) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(isOpen ? "Restart Session" : "Open Session")
             }
 
             if isHovered || metadata.starred {
@@ -459,11 +727,32 @@ private struct SessionRow: View {
         .modifier(SidebarRowBackground(isSelected: false, isHovered: isHovered))
         .onHover { isHovered = $0 }
         .onTapGesture { if !isRenaming { onOpen() } }
+        .onDrag { NSItemProvider(object: session.id as NSString) }
         .help(tooltip)
         .contextMenu {
             Button("Open") { onOpen() }
+            Button("Restart Session", action: onRestart)
+                .disabled(!canRestart)
             Divider()
             Button(metadata.starred ? "Unstar" : "Star", action: onStar)
+            Menu("Move to Category") {
+                ForEach(categories, id: \.self) { name in
+                    Button {
+                        onSetCategory(name)
+                    } label: {
+                        if metadata.category == name {
+                            Label(name, systemImage: "checkmark")
+                        } else {
+                            Text(name)
+                        }
+                    }
+                }
+                if !categories.isEmpty { Divider() }
+                Button("New Category…", action: onNewCategory)
+                if metadata.category != nil {
+                    Button("Remove from Category") { onSetCategory(nil) }
+                }
+            }
             Button(isArchived ? "Unarchive" : "Archive", action: onArchive)
             Button("Rename…", action: onBeginRename)
             if metadata.displayName != nil {
@@ -544,4 +833,69 @@ private struct ContextBar: View {
         }
         .frame(width: 24, height: 5)
     }
+}
+
+/// The popover form for starting a requirement with `ihk flow run`.
+private struct NewRequirementForm: View {
+    let onStart: (_ id: String, _ workflow: String) -> Void
+
+    @State private var requirementID = ""
+    @State private var workflows: [String] = []
+    @State private var workflow = ""
+    @FocusState private var idFocused: Bool
+
+    private var trimmedID: String {
+        requirementID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+    }
+
+    private var canStart: Bool {
+        NewRequirement.isValidID(trimmedID) && !workflow.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("New Requirement")
+                .font(.headline)
+
+            TextField("Task ID, e.g. T-IBT-614650", text: $requirementID)
+                .textFieldStyle(.roundedBorder)
+                .focused($idFocused)
+                .onSubmit { if canStart { onStart(trimmedID, workflow) } }
+
+            if workflows.isEmpty {
+                ProgressView().controlSize(.small)
+            } else {
+                Picker("Workflow", selection: $workflow) {
+                    ForEach(workflows, id: \.self) { Text($0).tag($0) }
+                }
+            }
+
+            Text("Runs ihk flow run in \((NewRequirement.directory as NSString).abbreviatingWithTildeInPath)")
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                Button("Start") { onStart(trimmedID, workflow) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canStart)
+            }
+        }
+        .padding(14)
+        .frame(width: 300)
+        .onAppear {
+            idFocused = true
+            NewRequirement.loadWorkflows { names in
+                workflows = names
+                // Remember the last choice since it's usually the same.
+                let last = UserDefaults.standard.string(forKey: Self.lastWorkflowKey)
+                workflow = names.first { $0 == last } ?? names[0]
+            }
+        }
+        .onChange(of: workflow) { value in
+            if !value.isEmpty { UserDefaults.standard.set(value, forKey: Self.lastWorkflowKey) }
+        }
+    }
+
+    private static let lastWorkflowKey = "SessionSidebarLastWorkflow"
 }

@@ -69,10 +69,6 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
     }
 
-    /// Claude session tabs close without confirmation: the session can be resumed
-    /// from the sidebar, so killing Claude loses nothing that can't be recovered.
-    override var skipsCloseConfirmation: Bool { claudeSessionID != nil }
-
     /// Updates the title when the session's sidebar name or title changes.
     private var claudeSessionTitleCancellable: AnyCancellable?
 
@@ -138,11 +134,68 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         return accessory
     }
 
+    /// Whether `claudeSessionID` has been seen running in this tab. Until then it is
+    /// only an intent (e.g. `claude --resume` was typed but hasn't started yet).
+    private var claudeSessionSeenLive = false
+
+    /// Called by ClaudeLiveSessions with the session running in this tab, if any.
+    /// Adopts sessions started by hand and forgets ones that have exited.
+    func claudeSessionObserved(_ live: String?) {
+        if let live {
+            claudeSessionSeenLive = true
+            guard claudeSessionID != live else { return }
+            claudeSessionID = live
+            let session = ClaudeSessionStore.shared.sessions.first { $0.id == live }
+            claudeSessionDir = session?.projectDir ?? session?.cwd ?? focusedSurface?.pwd
+        } else if claudeSessionSeenLive {
+            claudeSessionSeenLive = false
+            claudeSessionID = nil
+            claudeSessionDir = nil
+        }
+    }
+
+    /// Quits the Claude session running in this tab and resumes it again, e.g. to pick
+    /// up changed settings, skills, or MCP servers.
+    func restartClaudeSession() {
+        guard let sessionID = claudeSessionID else { return }
+        let directory = claudeSessionDir
+
+        // Mark as not live first so the exit isn't mistaken for the user quitting.
+        claudeSessionSeenLive = false
+
+        guard let pid = ClaudeLiveSessions.shared.running[sessionID],
+              ClaudeLiveSessions.shared.controller(for: sessionID) === self else {
+            resumeClaudeSession(sessionID, in: directory)
+            return
+        }
+
+        kill(pid, SIGTERM)
+        waitForExit(pid, attempts: 0) { [weak self] in
+            // Give the shell a moment to redraw its prompt before typing into it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(300)) {
+                self?.resumeClaudeSession(sessionID, in: directory)
+            }
+        }
+    }
+
+    private func waitForExit(_ pid: pid_t, attempts: Int, then done: @escaping () -> Void) {
+        guard kill(pid, 0) == 0 else { return done() }
+
+        // Force it after ~5s.
+        if attempts == 50 { kill(pid, SIGKILL) }
+        guard attempts < 60 else { return done() }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+            self?.waitForExit(pid, attempts: attempts + 1, then: done)
+        }
+    }
+
     /// Types `claude --resume` into the focused surface of a restored tab. The shell
     /// starts in the restored pwd, which may not be the session's project directory.
     func resumeClaudeSession(_ sessionID: String, in directory: String?, attempts: Int = 0) {
         claudeSessionID = sessionID
         claudeSessionDir = directory
+        claudeSessionSeenLive = false
 
         // Surfaces are created asynchronously on restore; wait for one (up to ~5s).
         guard let surface = (focusedSurface ?? surfaceTree.root?.leftmostLeaf())?.surfaceModel else {
@@ -1091,7 +1144,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // needs quit confirmation. This lets us attach the confirmation to something
         // that is running.
         guard let confirmWindow = all
-            .first(where: { $0.needsCloseConfirmation })?
+            .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })?
             .surfaceTree.first(where: { $0.needsConfirmQuit })?
             .window
         else {
@@ -1446,7 +1499,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
-        guard needsCloseConfirmation else {
+        guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
             closeTabImmediately()
             return
         }
@@ -1477,7 +1530,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             }
 
             // Check if any surfaces require confirmation
-            return controller.needsCloseConfirmation
+            return controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
         }) else {
             self.closeOtherTabsImmediately()
             return
@@ -1504,7 +1557,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 return false
             }
 
-            return controller.needsCloseConfirmation
+            return controller.surfaceTree.contains(where: { $0.needsConfirmQuit })
         }
 
         if !needsConfirm {
@@ -1563,7 +1616,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let windows: [NSWindow] = window.tabGroup?.windows ?? [window]
         let confirmControllers = windows
             .compactMap({ $0.windowController as? TerminalController })
-            .filter({ $0.needsCloseConfirmation })
+            .filter({ $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })
         guard
             !confirmControllers.isEmpty
         else {

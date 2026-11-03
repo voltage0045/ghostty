@@ -19,6 +19,10 @@ final class ClaudeLiveSessions: ObservableObject {
 
     private var cancellables: Set<AnyCancellable> = []
 
+    /// Set once the app starts quitting. Claude exits along with its terminal then,
+    /// which must not detach sessions from tabs before window state is saved.
+    private var isTerminating = false
+
     private init() {
         // Cheap: a handful of tiny files plus a syscall per terminal.
         let center = NotificationCenter.default
@@ -31,6 +35,10 @@ final class ClaudeLiveSessions: ObservableObject {
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in self?.refresh() }
         .store(in: &cancellables)
+
+        center.publisher(for: NSApplication.willTerminateNotification)
+            .sink { [weak self] _ in self?.isTerminating = true }
+            .store(in: &cancellables)
 
         refresh()
     }
@@ -54,6 +62,7 @@ final class ClaudeLiveSessions: ObservableObject {
         if newRunning != running { running = newRunning }
 
         // Attach sessions to the tabs running them.
+        guard !isTerminating else { return }
         for controller in TerminalController.all {
             let live = controller.surfaceTree.lazy
                 .compactMap { $0.surfaceModel?.foregroundPID }

@@ -365,8 +365,7 @@ struct SessionSidebarView: View {
         }
 
         if !collapsed {
-            ForEach(filed) { sessionRow($0) }
-                .padding(.leading, 12)
+            ForEach(filed) { sessionRow($0, indented: true) }
         }
     }
 
@@ -466,9 +465,10 @@ struct SessionSidebarView: View {
     }
 
     @ViewBuilder
-    private func sessionRow(_ session: ClaudeSession) -> some View {
+    private func sessionRow(_ session: ClaudeSession, indented: Bool = false) -> some View {
         SessionRow(
             session: session,
+            indented: indented,
             title: sessions.displayTitle(for: session),
             metadata: sessions.metadata(for: session.id),
             isArchived: sessions.isArchived(session),
@@ -640,6 +640,10 @@ private struct SidebarRowBackground: ViewModifier {
 
 private struct SessionRow: View {
     let session: ClaudeSession
+
+    /// Rows inside a category are indented. This is part of the row (rather than a
+    /// modifier on the ForEach) so lazily reused rows always get it.
+    let indented: Bool
     let title: String
     let metadata: ClaudeSessionMetadata
     let isArchived: Bool
@@ -725,6 +729,7 @@ private struct SessionRow: View {
         }
         .padding(.vertical, 4)
         .modifier(SidebarRowBackground(isSelected: false, isHovered: isHovered))
+        .padding(.leading, indented ? 12 : 0)
         .onHover { isHovered = $0 }
         .onTapGesture { if !isRenaming { onOpen() } }
         .onDrag { NSItemProvider(object: session.id as NSString) }

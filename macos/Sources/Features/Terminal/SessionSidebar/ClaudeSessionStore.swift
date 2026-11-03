@@ -3,7 +3,7 @@ import Combine
 import AppKit
 
 /// A Claude Code session discovered on disk.
-struct ClaudeSession: Identifiable, Equatable {
+struct ClaudeSession: Identifiable, Equatable, Codable {
     /// The session ID (the jsonl file name without extension).
     let id: String
 
@@ -80,7 +80,56 @@ final class ClaudeSessionStore: ObservableObject {
 
     /// Parsing happens on this queue. The cache is only accessed from it.
     private let queue = DispatchQueue(label: "com.mitchellh.ghostty.claude-sessions", qos: .utility)
-    private var cache: [URL: (modified: Date, size: Int, session: ClaudeSession?)] = [:]
+    private var cache: [URL: CacheEntry] = [:]
+
+    private struct CacheEntry: Codable {
+        let modified: Date
+        let size: Int
+        let session: ClaudeSession?
+    }
+
+    /// Parsed sessions are cached on disk so launching doesn't rescan every file.
+    private let cacheURL: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Caches")
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.mitchellh.ghostty"
+        return base
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent("claude-sessions-cache.json")
+    }()
+
+    /// Bumped when parsing changes so stale cached results are discarded.
+    private static let cacheVersion = 1
+    private var cacheLoaded = false
+
+    private struct CacheFile: Codable {
+        let version: Int
+        let entries: [String: CacheEntry]
+    }
+
+    /// Loads the disk cache. Called on `queue`.
+    private func loadCacheIfNeeded() {
+        guard !cacheLoaded else { return }
+        cacheLoaded = true
+        guard let data = try? Data(contentsOf: cacheURL),
+              let file = try? JSONDecoder().decode(CacheFile.self, from: data),
+              file.version == Self.cacheVersion else { return }
+        cache = Dictionary(uniqueKeysWithValues: file.entries.map { (URL(fileURLWithPath: $0.key), $0.value) })
+    }
+
+    /// Saves the disk cache. Called on `queue`.
+    private func saveCache() {
+        let file = CacheFile(
+            version: Self.cacheVersion,
+            entries: Dictionary(uniqueKeysWithValues: cache.map { ($0.key.path, $0.value) }))
+        do {
+            try FileManager.default.createDirectory(
+                at: cacheURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try JSONEncoder().encode(file).write(to: cacheURL, options: .atomic)
+        } catch {
+            AppDelegate.logger.warning("failed to save claude session cache: \(error.localizedDescription)")
+        }
+    }
     private var scanInFlight = false
 
     /// Lowercased user prompts per session file, for search. Only accessed on `queue`.
@@ -364,6 +413,10 @@ final class ClaudeSessionStore: ObservableObject {
     }
 
     private func scan() -> [ClaudeSession] {
+        loadCacheIfNeeded()
+        var changed = false
+        defer { if changed { saveCache() } }
+
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isDirectoryKey]
         guard let projects = try? fm.contentsOfDirectory(
@@ -392,13 +445,16 @@ final class ClaudeSessionStore: ObservableObject {
                 }
 
                 let session = Self.parse(file: file, modified: modified)
-                cache[file] = (modified, size, session)
+                cache[file] = CacheEntry(modified: modified, size: size, session: session)
+                changed = true
                 if let session { result.append(session) }
             }
         }
 
         // Drop cache entries for deleted files.
-        cache = cache.filter { seen.contains($0.key) }
+        let kept = cache.filter { seen.contains($0.key) }
+        if kept.count != cache.count { changed = true }
+        cache = kept
 
         return result.sorted { $0.lastActivity > $1.lastActivity }
     }
@@ -414,21 +470,33 @@ final class ClaudeSessionStore: ObservableObject {
         let size = (try? handle.seekToEnd()) ?? 0
         try? handle.seek(toOffset: 0)
 
-        var lines: [Substring] = []
+        // Files are scanned as bytes: decoding hundreds of MB into Swift strings
+        // just to search them made startup scans take seconds.
+        let buffer: Data
+        var lines: [Range<Int>]
         if size <= UInt64(chunkSize * 2) {
             guard let data = try? handle.readToEnd() else { return nil }
-            lines = String(decoding: data, as: UTF8.self).split(separator: "\n")
+            buffer = data
+            lines = lineRanges(in: buffer)
         } else {
             let head = (try? handle.read(upToCount: chunkSize)) ?? Data()
             try? handle.seek(toOffset: size - UInt64(chunkSize))
             let tail = (try? handle.readToEnd()) ?? Data()
+            buffer = head + Data([0x0A]) + tail
 
             // Drop the possibly-partial last line of the head and first line of the tail.
-            var headLines = String(decoding: head, as: UTF8.self).split(separator: "\n")
+            var headLines = lineRanges(in: buffer, upTo: head.count)
             if !headLines.isEmpty { headLines.removeLast() }
-            var tailLines = String(decoding: tail, as: UTF8.self).split(separator: "\n")
+            var tailLines = lineRanges(in: buffer, from: head.count + 1)
             if !tailLines.isEmpty { tailLines.removeFirst() }
             lines = headLines + tailLines
+        }
+
+        let has = { (range: Range<Int>, marker: [UInt8]) -> Bool in
+            contains(buffer, range, marker)
+        }
+        let object = { (range: Range<Int>) -> [String: Any]? in
+            mainChainObject(buffer.subdata(in: range))
         }
 
         var customTitle: String?
@@ -437,24 +505,24 @@ final class ClaudeSessionStore: ObservableObject {
         var firstPrompt: String?
         var oneMillion = false
 
-        // cwd and usage lines are frequent and can be large, so we only collect them
+        // cwd and usage lines are frequent and can be large, so we only note them
         // here and JSON-parse just the few we need afterwards.
-        var cwdLines: [Substring] = []
-        var usageLines: [(index: Int, line: Substring)] = []
-        var lastCompact: (index: Int, line: Substring)?
+        var cwdLines: [Range<Int>] = []
+        var usageLines: [(index: Int, line: Range<Int>)] = []
+        var lastCompact: (index: Int, line: Range<Int>)?
 
         for (index, line) in lines.enumerated() {
             // The 1M context variant is only visible as a "[1m]" model suffix
             // (e.g. in /model output), never in the assistant message itself.
-            if !oneMillion && line.contains("[1m]") { oneMillion = true }
+            if !oneMillion && has(line, Marker.oneMillion) { oneMillion = true }
 
-            if line.contains("\"cwd\"") { cwdLines.append(line) }
-            if line.contains("\"type\":\"assistant\"") && line.contains("\"usage\"") { usageLines.append((index, line)) }
-            if line.contains("\"compact_boundary\"") { lastCompact = (index, line) }
+            if has(line, Marker.cwd) { cwdLines.append(line) }
+            if has(line, Marker.assistant) && has(line, Marker.usage) { usageLines.append((index, line)) }
+            if has(line, Marker.compact) { lastCompact = (index, line) }
 
-            let isTitle = line.contains("\"custom-title\"") || line.contains("\"ai-title\"") || line.contains("\"type\":\"summary\"")
-            let wantsPrompt = firstPrompt == nil && line.contains("\"type\":\"user\"")
-            guard isTitle || wantsPrompt, let obj = mainChainObject(line) else { continue }
+            let isTitle = has(line, Marker.customTitle) || has(line, Marker.aiTitle) || has(line, Marker.summary)
+            let wantsPrompt = firstPrompt == nil && has(line, Marker.user)
+            guard isTitle || wantsPrompt, let obj = object(line) else { continue }
 
             switch obj["type"] as? String {
             case "custom-title":
@@ -475,8 +543,8 @@ final class ClaudeSessionStore: ObservableObject {
             }
         }
 
-        let cwdOf: (Substring) -> String? = { line in
-            guard let value = mainChainObject(line)?["cwd"] as? String, !value.isEmpty else { return nil }
+        let cwdOf: (Range<Int>) -> String? = { line in
+            guard let value = object(line)?["cwd"] as? String, !value.isEmpty else { return nil }
             return value
         }
         let projectDir = cwdLines.lazy.compactMap(cwdOf).first
@@ -489,7 +557,7 @@ final class ClaudeSessionStore: ObservableObject {
         var lastActivity: Date?
         var usageIndex = -1
         for (index, line) in usageLines.reversed() {
-            guard let obj = mainChainObject(line),
+            guard let obj = object(line),
                   let message = obj["message"] as? [String: Any],
                   let usage = message["usage"] as? [String: Any] else { continue }
             let keys = ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"]
@@ -508,7 +576,7 @@ final class ClaudeSessionStore: ObservableObject {
         // After /compact the context shrinks, but no assistant turn reports it until
         // the next reply. The compaction record carries the new size.
         if let lastCompact, lastCompact.index > usageIndex,
-           let obj = mainChainObject(lastCompact.line),
+           let obj = object(lastCompact.line),
            let meta = obj["compactMetadata"] as? [String: Any],
            let post = (meta["postTokens"] as? NSNumber)?.intValue {
             contextTokens = post
@@ -540,13 +608,48 @@ final class ClaudeSessionStore: ObservableObject {
         timestampFormatter.date(from: string)
     }
 
-    /// Parses a jsonl line, ignoring subagent (sidechain) entries which have
-    /// their own context and cwd.
-    private static func mainChainObject(_ line: Substring) -> [String: Any]? {
-        guard let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+    private enum Marker {
+        static let oneMillion = Array("[1m]".utf8)
+        static let cwd = Array("\"cwd\"".utf8)
+        static let assistant = Array("\"type\":\"assistant\"".utf8)
+        static let usage = Array("\"usage\"".utf8)
+        static let compact = Array("\"compact_boundary\"".utf8)
+        static let customTitle = Array("\"custom-title\"".utf8)
+        static let aiTitle = Array("\"ai-title\"".utf8)
+        static let summary = Array("\"type\":\"summary\"".utf8)
+        static let user = Array("\"type\":\"user\"".utf8)
+    }
+
+    /// Byte ranges of the newline-delimited lines in `data[from..<upTo]`.
+    private static func lineRanges(in data: Data, from start: Int = 0, upTo limit: Int? = nil) -> [Range<Int>] {
+        let end = limit ?? data.count
+        var result: [Range<Int>] = []
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            var position = start
+            while position < end {
+                let found = memchr(base + position, 0x0A, end - position)
+                let lineEnd = found.map { base.distance(to: UnsafeRawPointer($0)) } ?? end
+                if lineEnd > position { result.append(position..<lineEnd) }
+                position = lineEnd + 1
+            }
+        }
+        return result
+    }
+
+    private static func contains(_ data: Data, _ range: Range<Int>, _ marker: [UInt8]) -> Bool {
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return false }
+            return memmem(base + range.lowerBound, range.count, marker, marker.count) != nil
+        }
+    }
+
+    private static func mainChainObject(_ line: Data) -> [String: Any]? {
+        guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               obj["isSidechain"] as? Bool != true else { return nil }
         return obj
     }
+
 
     /// Best-effort context window size. Claude 5 family models default to 1M
     /// in Claude Code; older models use 200k unless the 1M variant was selected.

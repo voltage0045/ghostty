@@ -106,12 +106,15 @@ final class ClaudeLiveSessions: ObservableObject {
         guard open != lastSavedOpenSessions else { return }
         lastSavedOpenSessions = open
 
-        do {
-            try FileManager.default.createDirectory(
-                at: openSessionsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(open).write(to: openSessionsURL, options: .atomic)
-        } catch {
-            AppDelegate.logger.warning("failed to save open claude sessions: \(error.localizedDescription)")
+        let url = openSessionsURL
+        queue.async {
+            do {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(open).write(to: url, options: .atomic)
+            } catch {
+                AppDelegate.logger.warning("failed to save open claude sessions: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -129,10 +132,28 @@ final class ClaudeLiveSessions: ObservableObject {
         }
     }
 
-    func refresh() {
-        var newRunning: [String: pid_t] = [:]
-        var sessionByPid: [pid_t: String] = [:]
+    /// File IO runs here: listing ~/.claude/sessions can block for 100ms+, which on
+    /// the main thread stalled drawing on every tab switch.
+    private let queue = DispatchQueue(label: "com.mitchellh.ghostty.claude-live-sessions", qos: .userInitiated)
+    private var refreshInFlight = false
 
+    func refresh() {
+        guard !refreshInFlight else { return }
+        refreshInFlight = true
+        let directory = self.directory
+        queue.async { [weak self] in
+            let found = Self.readRunning(in: directory)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.refreshInFlight = false
+                self.apply(found)
+            }
+        }
+    }
+
+    /// Running session IDs mapped to their Claude process IDs. Called on `queue`.
+    nonisolated private static func readRunning(in directory: URL) -> [String: pid_t] {
+        var result: [String: pid_t] = [:]
         let files = (try? FileManager.default.contentsOfDirectory(
             at: directory, includingPropertiesForKeys: nil)) ?? []
         for file in files where file.pathExtension == "json" {
@@ -140,10 +161,15 @@ final class ClaudeLiveSessions: ObservableObject {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let pid = (json["pid"] as? NSNumber)?.int32Value,
                   let sessionID = json["sessionId"] as? String,
-                  Self.isAlive(pid) else { continue }
-            newRunning[sessionID] = pid
-            sessionByPid[pid] = sessionID
+                  isAlive(pid) else { continue }
+            result[sessionID] = pid
         }
+        return result
+    }
+
+    private func apply(_ newRunning: [String: pid_t]) {
+        var sessionByPid: [pid_t: String] = [:]
+        for (sessionID, pid) in newRunning { sessionByPid[pid] = sessionID }
 
         if newRunning != running { running = newRunning }
 
@@ -181,7 +207,7 @@ final class ClaudeLiveSessions: ObservableObject {
         }
     }
 
-    private static func isAlive(_ pid: pid_t) -> Bool {
+    nonisolated private static func isAlive(_ pid: pid_t) -> Bool {
         kill(pid, 0) == 0 || errno == EPERM
     }
 }

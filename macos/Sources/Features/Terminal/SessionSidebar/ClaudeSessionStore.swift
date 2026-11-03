@@ -304,8 +304,9 @@ final class ClaudeSessionStore: ObservableObject {
         let generation = searchGeneration
         let needle = query.trimmingCharacters(in: .whitespaces).lowercased()
         guard !needle.isEmpty else {
-            contentMatches = nil
-            isSearching = false
+            // Every sidebar observes these, so only publish real changes.
+            if contentMatches != nil { contentMatches = nil }
+            if isSearching { isSearching = false }
             return
         }
 
@@ -399,8 +400,18 @@ final class ClaudeSessionStore: ObservableObject {
 
     // MARK: Scanning
 
+    private var lastRefresh: Date = .distantPast
+
+    /// Refresh unless one ran recently. Sidebars call this when they appear, which
+    /// happens on every tab switch.
+    func refreshIfStale() {
+        guard Date().timeIntervalSince(lastRefresh) > 10 else { return }
+        refresh()
+    }
+
     /// Rescan the Claude projects directory in the background.
     func refresh() {
+        lastRefresh = Date()
         queue.async { [weak self] in
             guard let self, !self.scanInFlight else { return }
             self.scanInFlight = true

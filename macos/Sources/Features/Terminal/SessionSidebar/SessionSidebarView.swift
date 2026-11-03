@@ -206,8 +206,7 @@ struct SessionSidebarView: View {
         }
         .environment(\.colorScheme, colorScheme)
         .onAppear {
-            model.refresh()
-            sessions.refresh()
+            sessions.refreshIfStale()
         }
     }
 
@@ -240,7 +239,10 @@ struct SessionSidebarView: View {
             toolbar
 
             ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                // Not lazy: a session moving between sections keeps its ID, and a
+                // LazyVStack would reuse the stale row at its old position. There are
+                // only tens of rows, so laziness buys nothing.
+                VStack(alignment: .leading, spacing: 2) {
                     SectionHeader(title: "Claude Sessions") {
                         HStack(spacing: 10) {
                             Button(action: newCategory) {
@@ -314,6 +316,8 @@ struct SessionSidebarView: View {
         }
         // Debounce content search while typing.
         .task(id: searchText) {
+            // Also runs when the view appears (every tab switch); nothing to do then.
+            guard !searchText.isEmpty || sessions.contentMatches != nil else { return }
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled else { return }
             sessions.searchContent(searchText)
@@ -375,7 +379,7 @@ struct SessionSidebarView: View {
         }
 
         if !collapsed {
-            ForEach(filed) { sessionRow($0, indented: true) }
+            ForEach(filed) { sessionRow($0, indented: true).id("\(name)/\($0.id)") }
         }
     }
 
@@ -503,6 +507,7 @@ struct SessionSidebarView: View {
             },
             onCancelRename: { renamingSessionID = nil },
             onResetName: { sessions.rename(session.id, to: nil) })
+        .equatable()
     }
 }
 
@@ -648,7 +653,16 @@ private struct SidebarRowBackground: ViewModifier {
     }
 }
 
-private struct SessionRow: View {
+private struct SessionRow: View, Equatable {
+    /// Closures are recreated on every render, so compare only the displayed data.
+    /// This lets SwiftUI skip rows that didn't change when the list re-renders.
+    static func == (lhs: SessionRow, rhs: SessionRow) -> Bool {
+        lhs.session == rhs.session && lhs.indented == rhs.indented && lhs.title == rhs.title
+            && lhs.metadata == rhs.metadata && lhs.isArchived == rhs.isArchived
+            && lhs.isOpen == rhs.isOpen && lhs.isRenaming == rhs.isRenaming
+            && lhs.categories == rhs.categories && lhs.canRestart == rhs.canRestart
+    }
+
     let session: ClaudeSession
 
     /// Rows inside a category are indented. This is part of the row (rather than a
@@ -836,17 +850,17 @@ private struct ContextBar: View {
         }
     }
 
+    private static let width: CGFloat = 24
+
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(Color.primary.opacity(0.12))
-                RoundedRectangle(cornerRadius: 1.5)
-                    .fill(fill)
-                    .frame(width: geo.size.width * min(max(used, 0), 1))
-            }
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(Color.primary.opacity(0.12))
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(fill)
+                .frame(width: Self.width * min(max(used, 0), 1))
         }
-        .frame(width: 24, height: 5)
+        .frame(width: Self.width, height: 5)
     }
 }
 

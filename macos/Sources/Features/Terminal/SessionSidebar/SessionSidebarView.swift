@@ -35,7 +35,7 @@ final class SessionSidebarModel: ObservableObject {
     /// The Ghostty tab running or opened for this session, if any.
     private func tab(for session: ClaudeSession) -> TerminalController? {
         ClaudeLiveSessions.shared.controller(for: session.id)
-            ?? TerminalController.all.first { $0.claudeSessionID == session.id && $0.window != nil }
+            ?? ClaudeLiveSessions.shared.openControllers.first { $0.claudeSessionID == session.id }
     }
 
     /// Focuses the tab already running this session, or opens a new tab that
@@ -46,11 +46,17 @@ final class SessionSidebarModel: ObservableObject {
             return
         }
 
-        let directory = session.projectDir ?? session.cwd
+        guard let controller else { return }
+        Self.resume(sessionID: session.id, in: session.projectDir ?? session.cwd, from: controller)
+    }
+
+    /// Opens a new tab that resumes a session.
+    static func resume(sessionID: String, in directory: String?, from controller: TerminalController) {
         let newController = newTab(
+            from: controller,
             in: directory,
-            command: "claude --resume \(Ghostty.Shell.quote(session.id))")
-        newController?.claudeSessionID = session.id
+            command: "claude --resume \(Ghostty.Shell.quote(sessionID))")
+        newController?.claudeSessionID = sessionID
         newController?.claudeSessionDir = directory
     }
 
@@ -79,7 +85,11 @@ final class SessionSidebarModel: ObservableObject {
     @discardableResult
     private func newTab(in directory: String?, command: String) -> TerminalController? {
         guard let controller else { return nil }
+        return Self.newTab(from: controller, in: directory, command: command)
+    }
 
+    @discardableResult
+    static func newTab(from controller: TerminalController, in directory: String?, command: String) -> TerminalController? {
         var config = Ghostty.SurfaceConfiguration()
         if let directory, FileManager.default.fileExists(atPath: directory) {
             config.workingDirectory = directory

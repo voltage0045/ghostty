@@ -77,7 +77,10 @@ final class SessionSidebarModel: ObservableObject {
     func startRequirement(_ requirementID: String, workflow: String) {
         newTab(
             in: NewRequirement.directory,
-            command: "ihk flow run \(Ghostty.Shell.quote(workflow)) --ddp \(Ghostty.Shell.quote(requirementID))")
+            // --daemon moves ihk's progress watcher to the background so the shell
+            // continues straight into Claude (via dcc) to run the workflow.
+            command: "ihk flow run \(Ghostty.Shell.quote(workflow)) --ddp \(Ghostty.Shell.quote(requirementID)) --daemon"
+                + " && dcc claude /workflow-run")
     }
 
     /// Opens a tab in `directory` (home if missing) and types `command` into its shell,
@@ -110,13 +113,19 @@ enum NewRequirement {
     /// Used when `ihk flow list` can't be read (e.g. the directory isn't initialized).
     static let fallbackWorkflows = ["mobility-tech-flow-v2", "mobility-tech-flow-v3", "mobility-tech-flow"]
 
+    private static let workflowsKey = "SessionSidebarWorkflows"
+
     /// The workflow selected by default.
     static let defaultWorkflow = "mobility-tech-flow-v2"
 
     /// Asks for a requirement ID and workflow. This is an AppKit alert rather than a
     /// SwiftUI popover: in the popover, ⌘V never reached the text field.
     static func prompt(_ onStart: @escaping (_ id: String, _ workflow: String) -> Void) {
-        loadWorkflows { workflows in
+        // `ihk flow list` takes several seconds, so show the last known list right
+        // away and refresh it in the background for next time.
+        let workflows = UserDefaults.standard.stringArray(forKey: workflowsKey) ?? fallbackWorkflows
+        loadWorkflows { names in UserDefaults.standard.set(names, forKey: workflowsKey) }
+        do {
             let alert = NSAlert()
             alert.messageText = "New Requirement"
             alert.informativeText = "Runs ihk flow run in \((directory as NSString).abbreviatingWithTildeInPath)"

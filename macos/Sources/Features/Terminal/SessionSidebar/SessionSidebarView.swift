@@ -110,6 +110,53 @@ enum NewRequirement {
     /// Used when `ihk flow list` can't be read (e.g. the directory isn't initialized).
     static let fallbackWorkflows = ["mobility-tech-flow-v2", "mobility-tech-flow-v3", "mobility-tech-flow"]
 
+    /// The workflow selected by default.
+    static let defaultWorkflow = "mobility-tech-flow-v2"
+
+    /// Asks for a requirement ID and workflow. This is an AppKit alert rather than a
+    /// SwiftUI popover: in the popover, ⌘V never reached the text field.
+    static func prompt(_ onStart: @escaping (_ id: String, _ workflow: String) -> Void) {
+        loadWorkflows { workflows in
+            let alert = NSAlert()
+            alert.messageText = "New Requirement"
+            alert.informativeText = "Runs ihk flow run in \((directory as NSString).abbreviatingWithTildeInPath)"
+            alert.addButton(withTitle: "Start")
+            alert.addButton(withTitle: "Cancel")
+
+            let field = NSTextField(frame: NSRect(x: 0, y: 32, width: 280, height: 24))
+            field.placeholderString = "Task ID, e.g. T-IBT-614650"
+            // Prefill from the clipboard when it holds an ID, the usual way IDs arrive.
+            if let clip = NSPasteboard.general.string(forType: .string)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).uppercased(),
+               isValidID(clip) {
+                field.stringValue = clip
+            }
+
+            let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 26))
+            popup.addItems(withTitles: workflows)
+            if workflows.contains(defaultWorkflow) {
+                popup.selectItem(withTitle: defaultWorkflow)
+            }
+
+            let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 56))
+            container.addSubview(field)
+            container.addSubview(popup)
+            alert.accessoryView = container
+            alert.window.initialFirstResponder = field
+
+            while alert.runModal() == .alertFirstButtonReturn {
+                let id = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                guard isValidID(id), let workflow = popup.titleOfSelectedItem else {
+                    NSSound.beep()
+                    alert.informativeText = "Enter a task ID like T-IBT-614650."
+                    continue
+                }
+                onStart(id, workflow)
+                return
+            }
+        }
+    }
+
     /// Requirement IDs look like "T-IBT-614650".
     static func isValidID(_ id: String) -> Bool {
         id.range(of: #"^[A-Z]+-[A-Z]+-\d+$"#, options: .regularExpression) != nil
@@ -176,7 +223,6 @@ struct SessionSidebarView: View {
     @State private var renamingSessionID: String?
     @State private var renameText = ""
     @State private var searchText = ""
-    @State private var showingNewRequirement = false
 
     private var background: Color {
         Color(nsColor: NSColor(ghostty.config.backgroundColor).blended(withFraction: 0.06, of: .white)
@@ -435,7 +481,9 @@ struct SessionSidebarView: View {
     private var toolbar: some View {
         VStack(spacing: 8) {
             Button {
-                showingNewRequirement = true
+                NewRequirement.prompt { id, workflow in
+                    model.startRequirement(id, workflow: workflow)
+                }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "plus.circle")
@@ -448,12 +496,6 @@ struct SessionSidebarView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .popover(isPresented: $showingNewRequirement, arrowEdge: .trailing) {
-                NewRequirementForm { id, workflow in
-                    showingNewRequirement = false
-                    model.startRequirement(id, workflow: workflow)
-                }
-            }
 
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
@@ -862,69 +904,4 @@ private struct ContextBar: View {
         }
         .frame(width: Self.width, height: 5)
     }
-}
-
-/// The popover form for starting a requirement with `ihk flow run`.
-private struct NewRequirementForm: View {
-    let onStart: (_ id: String, _ workflow: String) -> Void
-
-    @State private var requirementID = ""
-    @State private var workflows: [String] = []
-    @State private var workflow = ""
-    @FocusState private var idFocused: Bool
-
-    private var trimmedID: String {
-        requirementID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
-    }
-
-    private var canStart: Bool {
-        NewRequirement.isValidID(trimmedID) && !workflow.isEmpty
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("New Requirement")
-                .font(.headline)
-
-            TextField("Task ID, e.g. T-IBT-614650", text: $requirementID)
-                .textFieldStyle(.roundedBorder)
-                .focused($idFocused)
-                .onSubmit { if canStart { onStart(trimmedID, workflow) } }
-
-            if workflows.isEmpty {
-                ProgressView().controlSize(.small)
-            } else {
-                Picker("Workflow", selection: $workflow) {
-                    ForEach(workflows, id: \.self) { Text($0).tag($0) }
-                }
-            }
-
-            Text("Runs ihk flow run in \((NewRequirement.directory as NSString).abbreviatingWithTildeInPath)")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-
-            HStack {
-                Spacer()
-                Button("Start") { onStart(trimmedID, workflow) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!canStart)
-            }
-        }
-        .padding(14)
-        .frame(width: 300)
-        .onAppear {
-            idFocused = true
-            NewRequirement.loadWorkflows { names in
-                workflows = names
-                // Remember the last choice since it's usually the same.
-                let last = UserDefaults.standard.string(forKey: Self.lastWorkflowKey)
-                workflow = names.first { $0 == last } ?? names[0]
-            }
-        }
-        .onChange(of: workflow) { value in
-            if !value.isEmpty { UserDefaults.standard.set(value, forKey: Self.lastWorkflowKey) }
-        }
-    }
-
-    private static let lastWorkflowKey = "SessionSidebarLastWorkflow"
 }
